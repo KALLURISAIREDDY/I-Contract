@@ -1,0 +1,1732 @@
+"""
+PDF -> DOCX Converter  |  Priority-Based Overflow Compression  v15-fixed
+=========================================================================
+
+KEY FIXES OVER v15-improved
+----------------------------
+
+FIX 1 — PAGE-OBJECT LIFETIME BUG
+  pdfplumber Page objects become invalid once the `with pdfplumber.open()`
+  context closes.  All floor-derivation calls that need a page object now
+  happen INSIDE a single persistent pdfplumber session.
+
+FIX 2 — AVAILABLE_PT CALCULATION
+  The DOCX `available_pt` (usable body height) was mixing PDF margin data
+  with DOCX margin data inconsistently, producing values that were either
+  too large (overflow never triggered) or too small (over-compression).
+  Now:
+    available_pt = page_h_pt  - max(docx_top, pdf_top) - max(docx_bot, pdf_bot)
+  with a guaranteed positive fallback.
+
+FIX 3 — GEO ASSIGNMENT BEFORE PARAMS DERIVATION
+  Sections need their `.geo` assigned before `_derive_page_params` is
+  called, because params depend on geo.  The parse_sections → assign-geo
+  → assign-params ordering is now explicit and correct.
+
+FIX 4 — MAIN / FIX_OVERFLOW WIRING
+  `fix_overflow` no longer accepts `pdf_footers` (footer code is commented
+  out).  `main()` is updated to match.  The `pdfplumber` session for page
+  objects is opened once at the top of `fix_overflow` and kept alive for
+  the entire compression pass.
+
+FIX 5 — OVERFLOW DETECTION GUARD
+  Added a minimum-overflow threshold (1 pt) so tiny floating-point
+  discrepancies don't trigger unnecessary compression.
+
+FIX 6 — SECTION COUNT MISMATCH HANDLING
+  When pdf2docx produces fewer sections than PDF pages (common for
+  single-section documents), the reconciler now distributes geo objects
+  more robustly so every section gets a valid PageGeometry.
+
+COMPRESSION LOGIC — unchanged from v15-improved
+------------------------------------------------
+  Tier 0  Materialize implicit line spacing
+  Tier 1  Paragraph spacing  — greedy, largest first
+  Tier 2  Above-single line spacing — greedy, most-spaced first
+  Tier 3  Below-single to dynamic floor — greedy, most-headroom first
+  Tier R  Residual drain (≤ 2 pt remaining)
+  Tier 4  Physical scale (last resort)
+  Tier 5  Redistribute slack after resolution
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import statistics
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+import pdfplumber
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Pt
+from pdf2docx import Converter
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FILE PATHS — edit these to match your environment
+# ═══════════════════════════════════════════════════════════════════════════════
+
+PDF_PATH    = r"C:\Users\7000042027\Documents\Conversion\Sony_ISO.pdf"
+TEMP_DOCX   = "temp_converted.docx"
+OUTPUT_DOCX = "output.docx"
+DIAG_JSON   = "layout_extract.json"
+LOG_JSON    = "compression_log.json"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  OOXML SPEC CONSTANTS  (unit conversion facts — never change these)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+TWIPS_PER_PT:     int = 20
+HALF_PTS_PER_PT:  int = 2
+WORD_SINGLE_LINE: int = 240     # 100 % line spacing in OOXML units
+EMU_PER_PT:       int = 12700
+
+_TYPO_DESCENDER_FRAC:  float = 0.20
+_TYPO_ABS_FLOOR_RATIO: float = 1.0 - _TYPO_DESCENDER_FRAC   # 0.80
+
+_AVG_CHAR_WIDTH_FRAC:  float = 0.55
+_MIN_INLINE_SCALE:     float = 0.85
+_TEXT_MATCH_THRESHOLD: float = 0.70
+
+FOOTER_REGION_FRAC:    float = 0.12
+FOOTER_MIN_CHARS:      int   = 2
+FOOTER_FONT_RATIO:     float = 0.85
+CENTER_TOLERANCE_FRAC: float = 0.15
+RIGHT_THRESHOLD_FRAC:  float = 0.65
+
+# Minimum overflow in points before compression is triggered.
+# Prevents floating-point noise from causing unnecessary work.
+MIN_OVERFLOW_TRIGGER_PT: float = 1.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DATA CLASSES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class FooterLine:
+    text:      str
+    font_size: float
+    alignment: str
+    bold:      bool  = False
+    italic:    bool  = False
+    y_top:     float = 0.0
+    y_bot:     float = 0.0
+    x0:        float = 0.0
+    x1:        float = 0.0
+
+
+@dataclass
+class PdfFooter:
+    page_num:    int
+    lines:       List[FooterLine] = field(default_factory=list)
+    has_content: bool             = False
+    page_w:      float            = 0.0
+
+    @property
+    def full_text(self) -> str:
+        return " | ".join(ln.text.strip() for ln in self.lines if ln.text.strip())
+
+
+@dataclass
+class PdfLine:
+    page_num:  int
+    text:      str
+    x0:        float
+    x1:        float
+    y_top:     float
+    y_bot:     float
+    font_size: float
+    line_w:    float
+
+    @property
+    def norm_text(self) -> str:
+        return _norm(self.text)
+
+
+@dataclass
+class PageGeometry:
+    page_num:      int
+    page_h_pt:     float
+    page_w_pt:     float
+    content_top:   float
+    content_bot:   float
+    content_h_pt:  float
+    top_margin:    float
+    bot_margin:    float
+    body_h_pt:     float
+    buf_floor:     float
+    buf_ceil:      float
+    buffer:        float
+    has_text:      bool
+    median_gap_pt: float
+    median_font_hp: int
+
+    @property
+    def effective_h(self) -> float:
+        return self.content_h_pt * self.buffer
+
+    def to_dict(self) -> dict:
+        return {
+            "page":           self.page_num,
+            "page_h_pt":      round(self.page_h_pt,     3),
+            "page_w_pt":      round(self.page_w_pt,     3),
+            "content_top":    round(self.content_top,    3),
+            "content_bot":    round(self.content_bot,    3),
+            "content_h":      round(self.content_h_pt,   3),
+            "top_margin":     round(self.top_margin,     3),
+            "bot_margin":     round(self.bot_margin,     3),
+            "body_h":         round(self.body_h_pt,      3),
+            "buf_floor":      round(self.buf_floor,      4),
+            "buf_ceil":       round(self.buf_ceil,       4),
+            "buffer":         round(self.buffer,         4),
+            "has_text":       self.has_text,
+            "effective_h":    round(self.effective_h,    3),
+            "median_gap_pt":  round(self.median_gap_pt,  3),
+            "median_font_hp": self.median_font_hp,
+        }
+
+
+@dataclass
+class PageParams:
+    buffer:              float
+    floor_ratio:         float
+    tiny_threshold_pt:   float
+    large_threshold_pt:  float
+    expand_safety_pt:    float
+    safety_scale_factor: float
+    resolved_pt:         float
+    median_font_pt:      float
+
+
+@dataclass
+class ParaState:
+    p_elem:    object
+    idx:       int   = 0
+    text:      str   = ""
+    in_table:  bool  = False
+    font_hp:   int   = 20
+    before_tw: int   = 0
+    after_tw:  int   = 0
+    line_val:  int   = 0
+    line_rule: str   = ""
+    params:    Optional[PageParams] = None
+
+    @property
+    def font_pt(self) -> float:
+        return self.font_hp / HALF_PTS_PER_PT
+
+    @property
+    def has_explicit_line(self) -> bool:
+        return self.line_val > 0
+
+    @property
+    def effective_line(self) -> int:
+        return self.line_val if self.has_explicit_line else WORD_SINGLE_LINE
+
+    @property
+    def line_multiplier(self) -> float:
+        return self.effective_line / WORD_SINGLE_LINE
+
+    @property
+    def line_height_pt(self) -> float:
+        return self.line_multiplier * self.font_pt
+
+    @property
+    def floor_ratio(self) -> float:
+        return self.params.floor_ratio if self.params else _TYPO_ABS_FLOOR_RATIO
+
+    @property
+    def floor_line(self) -> int:
+        return max(1, int(self.effective_line * self.floor_ratio))
+
+    @property
+    def above_single_headroom(self) -> int:
+        return max(0, self.effective_line - WORD_SINGLE_LINE)
+
+    @property
+    def line_headroom(self) -> int:
+        return max(0, self.effective_line - self.floor_line)
+
+    @property
+    def para_spacing_pt(self) -> float:
+        return (self.before_tw + self.after_tw) / TWIPS_PER_PT
+
+    def to_dict(self) -> dict:
+        return {
+            "idx":            self.idx,
+            "text":           self.text[:80],
+            "in_table":       self.in_table,
+            "font_pt":        round(self.font_pt, 1),
+            "line_height_pt": round(self.line_height_pt, 2),
+            "floor_ratio":    round(self.floor_ratio, 4),
+            "floor_line":     self.floor_line,
+            "before_pt":      round(self.before_tw / TWIPS_PER_PT, 2),
+            "after_pt":       round(self.after_tw  / TWIPS_PER_PT, 2),
+            "line_val":       self.line_val,
+            "effective_l":    self.effective_line,
+            "line_rule":      self.line_rule,
+        }
+
+
+@dataclass
+class ParaSnapshot:
+    idx:       int
+    before_tw: int
+    after_tw:  int
+    line_val:  int
+
+
+@dataclass
+class Section:
+    index:         int
+    body_elems:    List[object]           = field(default_factory=list)
+    sect_pr:       Optional[object]       = None
+    page_h_pt:     float                  = 0.0
+    top_margin_pt: float                  = 0.0
+    bot_margin_pt: float                  = 0.0
+    available_pt:  float                  = 0.0
+    geo:           Optional[PageGeometry] = None
+    params:        Optional[PageParams]   = None
+
+    @property
+    def effective_pdf_h(self) -> float:
+        return self.geo.effective_h if self.geo else 0.0
+
+    @property
+    def resolved_pt(self) -> float:
+        return self.params.resolved_pt if self.params else (1.0 / TWIPS_PER_PT)
+
+    @property
+    def overflow_pt(self) -> float:
+        return max(0.0, self.effective_pdf_h - self.available_pt)
+
+    @property
+    def is_overflow(self) -> bool:
+        return self.overflow_pt > MIN_OVERFLOW_TRIGGER_PT
+
+    def iter_paragraphs(self):
+        for elem in self.body_elems:
+            tag = _ltag(elem)
+            if tag == "p":
+                yield elem, False
+            elif tag == "tbl":
+                for p in elem.findall(".//" + qn("w:p")):
+                    yield p, True
+
+    def live_states(self) -> List[ParaState]:
+        return [
+            _read_para(p, i, tbl, self.params)
+            for i, (p, tbl) in enumerate(self.iter_paragraphs(), start=1)
+        ]
+
+    def total_para_spacing_pt(self) -> float:
+        return sum(s.para_spacing_pt for s in self.live_states())
+
+    def tier1_capacity_pt(self) -> float:
+        return self.total_para_spacing_pt()
+
+    def tier2_capacity_pt(self) -> float:
+        return sum(
+            (s.above_single_headroom / WORD_SINGLE_LINE) * s.font_pt
+            for s in self.live_states()
+        )
+
+    def tier3_capacity_pt(self) -> float:
+        return sum(
+            (s.line_headroom / WORD_SINGLE_LINE) * s.font_pt
+            for s in self.live_states()
+        )
+
+    def snapshot_all(self) -> Dict[int, ParaSnapshot]:
+        snaps: Dict[int, ParaSnapshot] = {}
+        for i, (p, tbl) in enumerate(self.iter_paragraphs(), start=1):
+            ps = _read_para(p, i, tbl, self.params)
+            snaps[i] = ParaSnapshot(
+                idx=i, before_tw=ps.before_tw,
+                after_tw=ps.after_tw, line_val=ps.line_val
+            )
+        return snaps
+
+    def current_content_height_pt(self) -> float:
+        return sum(ps.line_height_pt + ps.para_spacing_pt
+                   for ps in self.live_states())
+
+    def available_width_pt(self) -> float:
+        if self.sect_pr is None:
+            return 0.0
+        pg_sz  = self.sect_pr.find(qn("w:pgSz"))
+        pg_mar = self.sect_pr.find(qn("w:pgMar"))
+        if pg_sz is None:
+            return 0.0
+        w_pt = _attr_dxa_to_pt(pg_sz.get(qn("w:w")))
+        lm   = _attr_dxa_to_pt(pg_mar.get(qn("w:left")))  if pg_mar is not None else 0.0
+        rm   = _attr_dxa_to_pt(pg_mar.get(qn("w:right"))) if pg_mar is not None else 0.0
+        col_w = w_pt - lm - rm
+        return col_w if col_w > 0 else w_pt * 0.80
+
+
+@dataclass
+class Action:
+    section:  int
+    para_idx: int
+    text:     str
+    tier:     str
+    field:    str
+    old_val:  float
+    new_val:  float
+    delta_pt: float
+
+    def to_dict(self) -> dict:
+        return {
+            "section":  self.section,
+            "para":     self.para_idx,
+            "text":     self.text[:60],
+            "tier":     self.tier,
+            "field":    self.field,
+            "old":      round(self.old_val,  3),
+            "new":      round(self.new_val,  3),
+            "delta_pt": round(self.delta_pt, 4),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DYNAMIC FLOOR RATIO DERIVATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _derive_floor_ratio_dynamic(
+    page,
+    median_font_pt: float,
+    line_count:     int,
+    available_pt:   float,
+) -> float:
+    """
+    Compute the minimum safe line-spacing floor for this page.
+    Returns value in [0.80, 0.95].
+
+    If page is None (e.g. pdfplumber context already closed), falls back
+    to the universal typographic floor (0.80).
+    """
+    descender_frac = _TYPO_DESCENDER_FRAC
+    if page is not None:
+        try:
+            ratios = [
+                ch["height"] / ch["size"]
+                for ch in (page.chars or [])
+                if ch.get("height") and ch.get("size") and ch["size"] > 0
+                and 0.5 <= ch["height"] / ch["size"] <= 1.5
+            ]
+            if len(ratios) >= 10:
+                med_ratio      = statistics.median(ratios)
+                descender_frac = max(0.12, min(0.30, med_ratio - 0.70))
+        except Exception:
+            pass
+
+    floor_from_font = 1.0 - descender_frac
+
+    density_adj = 0.0
+    if available_pt > 0 and median_font_pt > 0:
+        natural_lines = available_pt / median_font_pt
+        density       = line_count / natural_lines if natural_lines > 0 else 0.5
+        density_adj   = max(0.0, min(0.10, (density - 0.5) * 0.10))
+
+    return min(0.95, max(_TYPO_ABS_FLOOR_RATIO, floor_from_font + density_adj))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DYNAMIC PAGE PARAMETER DERIVATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _derive_page_params(geo: PageGeometry, sec: "Section",
+                        page_object=None) -> PageParams:
+    """Derive all compression parameters from actual page content."""
+    resolved_pt   = 1.0 / TWIPS_PER_PT
+
+    states        = sec.live_states()
+    all_font_pts  = sorted([ps.font_pt for ps in states if ps.font_pt > 0])
+    if not all_font_pts:
+        all_font_pts = [10.0]
+
+    n              = len(all_font_pts)
+    median_font_pt = all_font_pts[n // 2]
+    q1_font_pt     = all_font_pts[n // 4]
+    q3_font_pt     = all_font_pts[min(n - 1, (3 * n) // 4)]
+
+    if abs(q3_font_pt - q1_font_pt) < 0.5:
+        q1_font_pt = median_font_pt * 0.80
+        q3_font_pt = median_font_pt * 1.20
+
+    floor_ratio = _derive_floor_ratio_dynamic(
+        page_object, median_font_pt, len(states), sec.available_pt
+    )
+
+    overflow_pt = sec.overflow_pt
+    avail       = sec.available_pt
+    if avail > 0 and overflow_pt > 0:
+        ovf_frac = overflow_pt / avail
+        if ovf_frac <= 0.02:
+            safety_scale = 0.05
+        elif ovf_frac <= 0.10:
+            t = (ovf_frac - 0.02) / 0.08
+            safety_scale = 0.05 + t * 0.25
+        elif ovf_frac <= 0.25:
+            t = (ovf_frac - 0.10) / 0.15
+            safety_scale = 0.30 + t * 0.25
+        else:
+            safety_scale = 0.55
+    else:
+        safety_scale = 0.10
+
+    line_vals = [ps.effective_line for ps in states if ps.effective_line > 0]
+    median_lv = sorted(line_vals)[len(line_vals) // 2] if line_vals else WORD_SINGLE_LINE
+    expand_safety_pt = (median_lv / WORD_SINGLE_LINE) * median_font_pt
+
+    return PageParams(
+        buffer              = geo.buffer,
+        floor_ratio         = floor_ratio,
+        tiny_threshold_pt   = max(1.0, q1_font_pt),
+        large_threshold_pt  = max(q1_font_pt + 1.0, q3_font_pt),
+        expand_safety_pt    = expand_safety_pt,
+        safety_scale_factor = safety_scale,
+        resolved_pt         = resolved_pt,
+        median_font_pt      = median_font_pt,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PDF LINE EXTRACTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _text_similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    ta = set(_norm(a).split())
+    tb = set(_norm(b).split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(len(ta), len(tb))
+
+
+def _group_words_into_lines(words: list, line_tol_pt: float = 3.0) -> List[dict]:
+    if not words:
+        return []
+    words = sorted(words, key=lambda w: (round(w["top"] / line_tol_pt), w["x0"]))
+    lines, cur_line = [], [words[0]]
+    for w in words[1:]:
+        pm = (cur_line[-1]["top"] + cur_line[-1]["bottom"]) / 2.0
+        tm = (w["top"] + w["bottom"]) / 2.0
+        if abs(tm - pm) <= line_tol_pt:
+            cur_line.append(w)
+        else:
+            lines.append(cur_line)
+            cur_line = [w]
+    lines.append(cur_line)
+    result = []
+    for grp in lines:
+        text  = " ".join(w["text"] for w in grp)
+        x0    = min(w["x0"]     for w in grp)
+        x1    = max(w["x1"]     for w in grp)
+        y_top = min(w["top"]    for w in grp)
+        y_bot = max(w["bottom"] for w in grp)
+        result.append({"text": text, "x0": x0, "x1": x1,
+                        "y_top": y_top, "y_bot": y_bot, "width": x1 - x0})
+    return result
+
+
+def _dominant_font_size_on_line(page, y_top, y_bot, x0, x1) -> float:
+    tol   = 2.0
+    sizes = [float(ch["size"])
+             for ch in (page.chars or [])
+             if (ch["top"]    >= y_top - tol and ch["bottom"] <= y_bot + tol
+                 and ch["x0"] >= x0   - tol and ch["x1"]    <= x1   + tol
+                 and ch.get("size") and ch["size"] > 0)]
+    if not sizes:
+        return 10.0
+    sizes.sort()
+    return sizes[len(sizes) // 2]
+
+
+def extract_pdf_lines_per_page(pdf_path: str) -> Dict[int, List[PdfLine]]:
+    _hdr("STEP 1b: PDF LINE EXTRACTION")
+    result: Dict[int, List[PdfLine]] = {}
+    with pdfplumber.open(pdf_path) as pdf:
+        for i, page in enumerate(pdf.pages, 1):
+            words     = page.extract_words() or []
+            raw_lines = _group_words_into_lines(words)
+            pdf_lines = []
+            for rl in raw_lines:
+                fs = _dominant_font_size_on_line(
+                    page, rl["y_top"], rl["y_bot"], rl["x0"], rl["x1"])
+                pdf_lines.append(PdfLine(
+                    page_num=i, text=rl["text"],
+                    x0=rl["x0"], x1=rl["x1"],
+                    y_top=rl["y_top"], y_bot=rl["y_bot"],
+                    font_size=fs, line_w=rl["width"],
+                ))
+            result[i] = pdf_lines
+            print(f"  Page {i}: {len(pdf_lines)} lines", end="\r")
+    total = sum(len(v) for v in result.values())
+    print(f"\n  Total lines extracted: {total}")
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  INLINE LINE-LEVEL OVERFLOW FIX
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_all_runs(p_elem) -> list:
+    return p_elem.findall(".//" + qn("w:r"))
+
+
+def _get_run_font_hp(r_elem) -> Optional[int]:
+    rPr = r_elem.find(qn("w:rPr"))
+    if rPr is None:
+        return None
+    sz = rPr.find(qn("w:sz"))
+    if sz is None:
+        return None
+    v = sz.get(qn("w:val"))
+    return int(v) if v else None
+
+
+def _set_run_font_size(r_elem, new_hp: int) -> None:
+    rPr = r_elem.find(qn("w:rPr"))
+    if rPr is None:
+        rPr = OxmlElement("w:rPr")
+        r_elem.insert(0, rPr)
+    for local in ("w:sz", "w:szCs"):
+        el = rPr.find(qn(local))
+        if el is None:
+            el = OxmlElement(local)
+            rPr.append(el)
+        el.set(qn("w:val"), str(max(1, new_hp)))
+
+
+def _measure_para_text_width_pt(p_elem, default_font_hp: int = 20) -> float:
+    runs = _get_all_runs(p_elem)
+    if not runs:
+        text    = "".join(t.text or "" for t in p_elem.findall(".//" + qn("w:t")))
+        font_pt = default_font_hp / HALF_PTS_PER_PT
+        return len(text) * font_pt * _AVG_CHAR_WIDTH_FRAC
+    total = 0.0
+    for r in runs:
+        hp      = _get_run_font_hp(r) or default_font_hp
+        font_pt = hp / HALF_PTS_PER_PT
+        text    = "".join(t.text or "" for t in r.findall(qn("w:t")))
+        total  += len(text) * font_pt * _AVG_CHAR_WIDTH_FRAC
+    return total
+
+
+def _is_single_line_para(p_elem) -> bool:
+    text = "".join(t.text or "" for t in p_elem.findall(".//" + qn("w:t"))).strip()
+    if not text:
+        return False
+    return not bool(p_elem.findall(".//" + qn("w:br")))
+
+
+def fix_inline_line_overflow(
+    sections:  List[Section],
+    pdf_lines: Dict[int, List[PdfLine]],
+    log:       List[Action],
+) -> int:
+    _hdr("STEP A: INLINE LINE-LEVEL OVERFLOW FIX")
+    total_fixed = 0
+    for sec in sections:
+        col_w = sec.available_width_pt()
+        if col_w <= 0:
+            continue
+        page_pdf_lines = pdf_lines.get(sec.index, [])
+        if not page_pdf_lines:
+            continue
+        fixed_on_page = 0
+        for para_i, (p_elem, in_table) in enumerate(sec.iter_paragraphs(), start=1):
+            if not _is_single_line_para(p_elem):
+                continue
+            para_text = "".join(t.text or "" for t in p_elem.findall(".//" + qn("w:t"))).strip()
+            if len(para_text) < 3:
+                continue
+            para_font_hp = _median_font_hp(p_elem)
+            est_width    = _measure_para_text_width_pt(p_elem, para_font_hp)
+            if est_width <= col_w:
+                continue
+            best_match, best_score = None, 0.0
+            for pl in page_pdf_lines:
+                score = _text_similarity(para_text, pl.text)
+                if score > best_score:
+                    best_score = score
+                    best_match = pl
+            if best_score < _TEXT_MATCH_THRESHOLD or best_match is None:
+                if est_width <= col_w * 1.10:
+                    continue
+                target_w = col_w
+            else:
+                target_w = min(col_w, best_match.x1 - best_match.x0)
+                if target_w <= 0:
+                    target_w = col_w
+            scale = max(_MIN_INLINE_SCALE, min(1.0, target_w / est_width))
+            if scale >= 1.0:
+                continue
+            runs = _get_all_runs(p_elem)
+            if not runs:
+                continue
+            changed = False
+            for r in runs:
+                old_hp = _get_run_font_hp(r) or para_font_hp
+                new_hp = max(int(old_hp * _MIN_INLINE_SCALE), int(round(old_hp * scale)))
+                if new_hp < old_hp:
+                    _set_run_font_size(r, new_hp)
+                    log.append(Action(sec.index, para_i, para_text[:60],
+                                      "A_inline_fix", "w:sz",
+                                      old_hp / HALF_PTS_PER_PT, new_hp / HALF_PTS_PER_PT,
+                                      (old_hp - new_hp) / HALF_PTS_PER_PT))
+                    changed = True
+            if changed:
+                fixed_on_page += 1
+        if fixed_on_page:
+            print(f"  Page {sec.index}: {fixed_on_page} lines corrected "
+                  f"(col_w={col_w:.1f}pt)")
+        total_fixed += fixed_on_page
+    print(f"\n  Total lines fixed: {total_fixed}")
+    return total_fixed
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  XML HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _ltag(elem) -> str:
+    t = elem.tag
+    return t.split("}")[-1] if "}" in t else t
+
+
+def _attr_dxa_to_pt(val: Optional[str], default: float = 0.0) -> float:
+    if not val:
+        return default
+    try:
+        return int(val) / TWIPS_PER_PT
+    except (TypeError, ValueError):
+        return default
+
+
+def _median_font_hp(p_elem) -> int:
+    vals = sorted([int(sz.get(qn("w:val")))
+                   for sz in p_elem.findall(".//" + qn("w:sz"))
+                   if sz.get(qn("w:val")) and sz.get(qn("w:val")).isdigit()])
+    return vals[len(vals) // 2] if vals else 20
+
+
+def _get_text(p_elem, n: int = 80) -> str:
+    parts = [t.text for t in p_elem.findall(".//" + qn("w:t")) if t.text]
+    s = "".join(parts).strip()
+    return (s[:n] + "…") if len(s) > n else s
+
+
+def _read_para(p_elem, idx: int = 0, in_table: bool = False,
+               params: Optional[PageParams] = None) -> ParaState:
+    ps = ParaState(
+        p_elem=p_elem, idx=idx,
+        text=_get_text(p_elem), in_table=in_table,
+        font_hp=_median_font_hp(p_elem), params=params,
+    )
+    pPr = p_elem.find(qn("w:pPr"))
+    if pPr is None:
+        return ps
+    sp = pPr.find(qn("w:spacing"))
+    if sp is None:
+        return ps
+    b = sp.get(qn("w:before"))
+    a = sp.get(qn("w:after"))
+    l = sp.get(qn("w:line"))
+    r = sp.get(qn("w:lineRule"))
+    ps.before_tw = int(b) if b else 0
+    ps.after_tw  = int(a) if a else 0
+    ps.line_val  = int(l) if l else 0
+    ps.line_rule = r or ""
+    return ps
+
+
+def _write_spacing(p_elem, before_tw, after_tw, line_val=None, floor_val=0):
+    pPr = p_elem.find(qn("w:pPr"))
+    if pPr is None:
+        pPr = OxmlElement("w:pPr")
+        p_elem.insert(0, pPr)
+    sp = pPr.find(qn("w:spacing"))
+    if sp is None:
+        sp = OxmlElement("w:spacing")
+        pPr.append(sp)
+    sp.set(qn("w:before"), str(max(0, before_tw)))
+    sp.set(qn("w:after"),  str(max(0, after_tw)))
+    if line_val is not None:
+        sp.set(qn("w:line"),     str(max(floor_val, line_val)))
+        sp.set(qn("w:lineRule"), "auto")
+
+
+def _get_style_line_val(p_elem, doc: Optional[Document]) -> int:
+    pPr    = p_elem.find(qn("w:pPr"))
+    if pPr is None:
+        return WORD_SINGLE_LINE
+    pStyle = pPr.find(qn("w:pStyle"))
+    if pStyle is None or doc is None:
+        return WORD_SINGLE_LINE
+    style_id    = pStyle.get(qn("w:val"), "")
+    styles_root = doc.element.find(".//" + qn("w:styles"))
+    if not style_id or styles_root is None:
+        return WORD_SINGLE_LINE
+    for style in styles_root.findall(qn("w:style")):
+        if style.get(qn("w:styleId")) == style_id:
+            pPr_s = style.find(qn("w:pPr"))
+            if pPr_s is not None:
+                sp_s = pPr_s.find(qn("w:spacing"))
+                if sp_s is not None:
+                    lv = sp_s.get(qn("w:line"))
+                    if lv:
+                        return int(lv)
+    return WORD_SINGLE_LINE
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PDF LAYOUT EXTRACTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _measure_page_gaps(words: list) -> float:
+    if len(words) < 2:
+        return 0.0
+    sw   = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    gaps = sorted([sw[i + 1]["top"] - sw[i]["bottom"]
+                   for i in range(len(sw) - 1)
+                   if sw[i + 1]["top"] - sw[i]["bottom"] > 0])
+    return gaps[len(gaps) // 2] if gaps else 0.0
+
+
+def _compute_buffer_dynamic(body_h, content_h, median_gap_pt):
+    if content_h <= 0 or body_h <= 0:
+        return 1.0, 1.0, 1.0
+    raw_buf      = body_h / content_h
+    leading_frac = max(0.01, median_gap_pt / content_h) if median_gap_pt > 0 else 0.01
+    buf_floor    = 1.0 + leading_frac
+    buf_ceil     = raw_buf
+    if buf_floor >= buf_ceil:
+        buf_floor = 1.0 + 0.01
+    return max(buf_floor, min(buf_ceil, raw_buf)), buf_floor, buf_ceil
+
+
+def _collect_page_font_sizes(page) -> int:
+    sizes = sorted([int(round(ch["size"] * HALF_PTS_PER_PT))
+                    for ch in (page.chars or []) if ch.get("size") and ch["size"] > 0])
+    return sizes[len(sizes) // 2] if sizes else 20
+
+
+def extract_pdf_layout(pdf_path: str) -> List[PageGeometry]:
+    _hdr("STEP 1: PDF LAYOUT EXTRACTION")
+    geos: List[PageGeometry] = []
+    with pdfplumber.open(pdf_path) as pdf:
+        n = len(pdf.pages)
+        print(f"  Pages detected: {n}")
+        for i, page in enumerate(pdf.pages, 1):
+            ph    = float(page.height)
+            pw    = float(page.width)
+            words = page.extract_words() or []
+            if words:
+                ct, cb     = min(w["top"] for w in words), max(w["bottom"] for w in words)
+                has_text   = True
+                median_gap = _measure_page_gaps(words)
+            else:
+                ct, cb     = 0.0, ph
+                has_text   = False
+                median_gap = 0.0
+            content_h = max(0.0, cb - ct)
+            top_m     = ct
+            bot_m     = ph - cb
+            body_h    = ph - top_m - bot_m
+            buf, buf_fl, buf_cl = (
+                _compute_buffer_dynamic(body_h, content_h, median_gap)
+                if has_text and content_h > 0 else (1.0, 1.0, 1.0)
+            )
+            geos.append(PageGeometry(
+                page_num       = i,
+                page_h_pt      = ph,
+                page_w_pt      = pw,
+                content_top    = ct,
+                content_bot    = cb,
+                content_h_pt   = content_h,
+                top_margin     = top_m,
+                bot_margin     = bot_m,
+                body_h_pt      = body_h,
+                buf_floor      = buf_fl,
+                buf_ceil       = buf_cl,
+                buffer         = buf,
+                has_text       = has_text,
+                median_gap_pt  = median_gap,
+                median_font_hp = _collect_page_font_sizes(page),
+            ))
+            print(f"  Page {i:>3}/{n}  h={ph:.1f}  buf=×{buf:.4f}", end="\r", flush=True)
+    print()
+    _print_geo_table(geos)
+    return geos
+
+
+def _print_geo_table(geos: List[PageGeometry]) -> None:
+    print(f"\n  {'Pg':>3}  {'PageH':>7}  {'Body':>7}  {'Content':>8}  "
+          f"{'Buf':>7}  {'EffH':>8}  {'Text'}")
+    print("  " + "─" * 60)
+    for g in geos:
+        print(f"  {g.page_num:>3}  {g.page_h_pt:>7.2f}  {g.body_h_pt:>7.2f}  "
+              f"{g.content_h_pt:>8.2f}  ×{g.buffer:>6.4f}  {g.effective_h:>8.2f}  "
+              f"{'yes' if g.has_text else 'img'}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PDF → DOCX CONVERSION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def convert_pdf_to_docx(pdf_path: str, out_path: str) -> None:
+    _hdr("STEP 2: PDF → DOCX  (pdf2docx)")
+    cv = Converter(pdf_path)
+    cv.convert(out_path, multi_processing=False)
+    cv.close()
+    print(f"  Saved: {out_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SECTION PARSING  — FIX 2: corrected available_pt calculation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _available_from_sectpr(sp, geo: Optional[PageGeometry]):
+    """
+    Compute usable body height for a section.
+
+    FIX: Previously this mixed DOCX margin values and PDF margin values in
+    an inconsistent way that could produce negative or zero available_pt.
+    Now:
+      - Use page height from geo (actual PDF page size) when available,
+        falling back to the w:pgSz value.
+      - Take the LARGER of the DOCX and PDF margin on each side, so we
+        never underestimate margins.
+      - Guarantee available_pt > 0 with a 5% floor.
+    """
+    # Determine page height
+    if geo is not None:
+        ph = geo.page_h_pt
+    elif sp is not None:
+        pg_sz = sp.find(qn("w:pgSz"))
+        ph    = _attr_dxa_to_pt(pg_sz.get(qn("w:h"))) if pg_sz is not None else 792.0
+        if ph <= 0:
+            ph = 792.0
+    else:
+        ph = 792.0
+
+    # Read DOCX margin values
+    tm_docx = bm_docx = 0.0
+    if sp is not None:
+        pg_mar = sp.find(qn("w:pgMar"))
+        if pg_mar is not None:
+            top_raw = _attr_dxa_to_pt(pg_mar.get(qn("w:top")))
+            bot_raw = _attr_dxa_to_pt(pg_mar.get(qn("w:bottom")))
+            hdr_raw = _attr_dxa_to_pt(pg_mar.get(qn("w:header")))
+            ftr_raw = _attr_dxa_to_pt(pg_mar.get(qn("w:footer")))
+            # Effective DOCX margin = whichever is larger: margin or header/footer distance
+            tm_docx = max(top_raw, hdr_raw) if hdr_raw > 0 else top_raw
+            bm_docx = max(bot_raw, ftr_raw) if ftr_raw > 0 else bot_raw
+
+    # Read PDF margin values
+    top_pdf = geo.top_margin if geo else 0.0
+    bot_pdf = geo.bot_margin if geo else 0.0
+
+    # Take the larger margin on each side to avoid underestimating
+    top = max(tm_docx, top_pdf)
+    bot = max(bm_docx, bot_pdf)
+
+    # Safety: if margins are zero (e.g., image-only page), use PDF margins
+    if top == 0.0:
+        top = top_pdf if top_pdf > 0 else ph * 0.08
+    if bot == 0.0:
+        bot = bot_pdf if bot_pdf > 0 else ph * 0.08
+
+    available = ph - top - bot
+
+    # Hard fallback: always leave at least 5% of page height as available
+    if available <= 0:
+        fallback_margin = ph * 0.08
+        top       = fallback_margin
+        bot       = fallback_margin
+        available = ph - top - bot
+
+    return available, ph, top, bot
+
+
+def parse_sections(doc: Document, geos: List[PageGeometry]) -> List[Section]:
+    body = doc.element.body
+    raw: List[Section] = []
+    cur = Section(index=1)
+    for elem in body:
+        tag = _ltag(elem)
+        if tag == "sectPr":
+            geo = geos[len(raw)] if len(raw) < len(geos) else None
+            av, ph, tm, bm = _available_from_sectpr(elem, geo)
+            cur.sect_pr, cur.available_pt = elem, av
+            cur.page_h_pt, cur.top_margin_pt, cur.bot_margin_pt = ph, tm, bm
+            raw.append(cur)
+            cur = Section(index=len(raw) + 1)
+        elif tag == "p":
+            pPr    = elem.find(qn("w:pPr"))
+            sectPr = pPr.find(qn("w:sectPr")) if pPr is not None else None
+            cur.body_elems.append(elem)
+            if sectPr is not None:
+                geo = geos[len(raw)] if len(raw) < len(geos) else None
+                av, ph, tm, bm = _available_from_sectpr(sectPr, geo)
+                cur.sect_pr, cur.available_pt = sectPr, av
+                cur.page_h_pt, cur.top_margin_pt, cur.bot_margin_pt = ph, tm, bm
+                raw.append(cur)
+                cur = Section(index=len(raw) + 1)
+        else:
+            cur.body_elems.append(elem)
+
+    # Collect any trailing section
+    if cur not in raw and (cur.body_elems or cur.sect_pr):
+        if cur.sect_pr is None and raw:
+            cur.sect_pr = raw[-1].sect_pr
+        geo = geos[len(raw)] if len(raw) < len(geos) else (geos[-1] if geos else None)
+        av, ph, tm, bm = _available_from_sectpr(cur.sect_pr, geo)
+        cur.available_pt = av
+        cur.page_h_pt, cur.top_margin_pt, cur.bot_margin_pt = ph, tm, bm
+        raw.append(cur)
+
+    sections = _reconcile(raw, len(geos))
+
+    # FIX 3: assign geo BEFORE params; params derivation depends on geo
+    for i, sec in enumerate(sections):
+        sec.geo = geos[i] if i < len(geos) else (geos[-1] if geos else None)
+
+    return sections
+
+
+def _reconcile(raw: List[Section], expected: int) -> List[Section]:
+    """
+    FIX 6: Robust reconciliation when section count != PDF page count.
+
+    pdf2docx often produces a single section for a multi-page document
+    (because Word's section model is not per-page).  In that case we
+    replicate the single section for each PDF page so every page gets
+    its own geo and params.
+    """
+    if len(raw) == expected:
+        for i, s in enumerate(raw, 1):
+            s.index = i
+        return raw
+
+    if len(raw) > expected:
+        # Merge extra sections into the last expected slot
+        target = raw[expected - 1]
+        for extra in raw[expected:]:
+            target.body_elems.extend(extra.body_elems)
+            if extra.sect_pr is not None:
+                target.sect_pr = extra.sect_pr
+        merged = raw[:expected]
+        for i, s in enumerate(merged, 1):
+            s.index = i
+        print(f"  [reconcile] merged {len(raw)-expected} extra → {expected} total")
+        return merged
+
+    # Fewer sections than pages (most common with pdf2docx)
+    print(f"  [reconcile] {len(raw)} DOCX sections for {expected} PDF pages "
+          f"— splitting content across pages")
+
+    # Distribute paragraphs evenly across expected pages
+    # (A simple even split; page-break markers are honoured below)
+    if not raw:
+        # Degenerate: no sections at all
+        fallback = [Section(index=i+1) for i in range(expected)]
+        return fallback
+
+    # Collect all body elements from all raw sections
+    all_elems = []
+    for s in raw:
+        all_elems.extend(s.body_elems)
+    ref_sectpr = raw[-1].sect_pr  # reuse last sectPr for all pages
+
+    # Find explicit page-break positions
+    page_break_idxs = []
+    for k, elem in enumerate(all_elems):
+        tag = _ltag(elem)
+        if tag == "p":
+            for br in elem.findall(".//" + qn("w:br")):
+                if br.get(qn("w:type")) in ("page", "column"):
+                    page_break_idxs.append(k)
+                    break
+
+    # Build sections by splitting on page breaks first
+    sections: List[Section] = []
+    cur = Section(index=1, sect_pr=ref_sectpr)
+    for k, elem in enumerate(all_elems):
+        cur.body_elems.append(elem)
+        if k in page_break_idxs:
+            sections.append(cur)
+            cur = Section(index=len(sections)+1, sect_pr=ref_sectpr)
+    if cur.body_elems or not sections:
+        sections.append(cur)
+
+    # If we still have fewer sections than expected, split largest sections
+    while len(sections) < expected:
+        largest_i = max(range(len(sections)),
+                        key=lambda i: len(sections[i].body_elems))
+        s = sections[largest_i]
+        if len(s.body_elems) < 2:
+            break  # Cannot split further
+        mid = len(s.body_elems) // 2
+        s1 = Section(index=0, sect_pr=ref_sectpr, body_elems=s.body_elems[:mid])
+        s2 = Section(index=0, sect_pr=ref_sectpr, body_elems=s.body_elems[mid:])
+        sections = sections[:largest_i] + [s1, s2] + sections[largest_i+1:]
+
+    # Trim to expected count if we ended up with too many
+    if len(sections) > expected:
+        for extra in sections[expected:]:
+            sections[expected-1].body_elems.extend(extra.body_elems)
+        sections = sections[:expected]
+
+    for i, s in enumerate(sections, 1):
+        s.index = i
+    return sections
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TIER 0: MATERIALIZE IMPLICIT LINE SPACING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def materialize_line_spacing(sec: Section, log: List[Action],
+                             doc: Document) -> None:
+    count = 0
+    for p, tbl in sec.iter_paragraphs():
+        ps = _read_para(p, 0, tbl, sec.params)
+        if not ps.has_explicit_line:
+            style_line = _get_style_line_val(p, doc)
+            floor_v    = max(1, int(style_line * sec.params.floor_ratio))
+            _write_spacing(p, ps.before_tw, ps.after_tw,
+                           line_val=style_line, floor_val=floor_v)
+            log.append(Action(sec.index, ps.idx, ps.text,
+                               "0_materialize", "w:line", 0.0, float(style_line), 0.0))
+            count += 1
+    if count:
+        print(f"    Tier 0: materialized {count} implicit line spacings")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TIER 1: PARAGRAPH SPACING — GREEDY, LARGEST-FIRST
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def tier1_drain_para_spacing(sec: Section, log: List[Action]) -> float:
+    need_pt = sec.overflow_pt
+    if need_pt <= sec.resolved_pt:
+        return 0.0
+
+    states = sorted(
+        [s for s in sec.live_states() if s.para_spacing_pt > 0],
+        key=lambda s: s.para_spacing_pt,
+        reverse=True,
+    )
+    if not states:
+        return need_pt
+
+    total_removed = 0.0
+    touched       = 0
+
+    for ps in states:
+        if need_pt <= sec.resolved_pt:
+            break
+
+        available_pt = ps.para_spacing_pt
+        remove_pt    = min(available_pt, need_pt)
+        remove_frac  = remove_pt / available_pt if available_pt > 0 else 0.0
+
+        new_b = max(0, int(ps.before_tw * (1.0 - remove_frac)))
+        new_a = max(0, int(ps.after_tw  * (1.0 - remove_frac)))
+
+        removed_pt = (ps.before_tw + ps.after_tw - new_b - new_a) / TWIPS_PER_PT
+        if removed_pt <= 0:
+            continue
+
+        _write_spacing(ps.p_elem, new_b, new_a)
+        for fname, old_tw, new_tw in [("before", ps.before_tw, new_b),
+                                       ("after",  ps.after_tw,  new_a)]:
+            if old_tw != new_tw:
+                log.append(Action(sec.index, ps.idx, ps.text,
+                                   "1_para_spacing", fname,
+                                   old_tw / TWIPS_PER_PT, new_tw / TWIPS_PER_PT,
+                                   (old_tw - new_tw) / TWIPS_PER_PT))
+        total_removed += removed_pt
+        need_pt        = max(0.0, need_pt - removed_pt)
+        touched       += 1
+
+    remaining = sec.overflow_pt
+    _tlog(1, f"para spacing greedy ({touched} paras touched)",
+          total_removed, remaining)
+    return remaining
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TIER 2: ABOVE-SINGLE LINE SPACING — GREEDY, MOST-SPACED-FIRST
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def tier2_compress_above_single(sec: Section, log: List[Action]) -> float:
+    need_pt = sec.overflow_pt
+    if need_pt <= sec.resolved_pt:
+        return 0.0
+
+    states = sorted(
+        [s for s in sec.live_states() if s.above_single_headroom > 0],
+        key=lambda s: (s.above_single_headroom / WORD_SINGLE_LINE) * s.font_pt,
+        reverse=True,
+    )
+    if not states:
+        return need_pt
+
+    total_removed = 0.0
+    touched       = 0
+
+    for ps in states:
+        if need_pt <= sec.resolved_pt:
+            break
+
+        cur_l           = ps.effective_line
+        headroom_pt     = (ps.above_single_headroom / WORD_SINGLE_LINE) * ps.font_pt
+        remove_pt       = min(headroom_pt, need_pt)
+        remove_frac     = remove_pt / headroom_pt if headroom_pt > 0 else 0.0
+        remove_units    = max(1, int(ps.above_single_headroom * remove_frac))
+        new_l           = max(WORD_SINGLE_LINE, cur_l - remove_units)
+        actual_removed  = ((cur_l - new_l) / WORD_SINGLE_LINE) * ps.font_pt
+
+        if actual_removed <= 0:
+            continue
+
+        _write_spacing(ps.p_elem, ps.before_tw, ps.after_tw,
+                       line_val=new_l, floor_val=WORD_SINGLE_LINE)
+        log.append(Action(sec.index, ps.idx, ps.text,
+                           "2_above_single", "w:line",
+                           float(cur_l), float(new_l), actual_removed))
+        total_removed += actual_removed
+        need_pt        = max(0.0, need_pt - actual_removed)
+        touched       += 1
+
+    remaining = sec.overflow_pt
+    _tlog(2, f"above-single greedy ({touched} paras touched)",
+          total_removed, remaining)
+    return remaining
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TIER 3: BELOW-SINGLE LINE COMPRESSION — GREEDY, MOST-HEADROOM-FIRST
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def tier3_minimum_line_compression(sec: Section, log: List[Action]) -> float:
+    need_pt = sec.overflow_pt
+    if need_pt <= sec.resolved_pt:
+        return 0.0
+
+    states = sorted(
+        [s for s in sec.live_states() if s.line_headroom > 0],
+        key=lambda s: (s.line_headroom / WORD_SINGLE_LINE) * s.font_pt,
+        reverse=True,
+    )
+    if not states:
+        print(f"    Tier 3: all lines at floor — {need_pt:.3f}pt unresolvable here")
+        return need_pt
+
+    total_removed = 0.0
+    touched       = 0
+
+    for ps in states:
+        if need_pt <= sec.resolved_pt:
+            break
+
+        cur_l       = ps.effective_line
+        floor_v     = ps.floor_line
+        headroom_pt = (ps.line_headroom / WORD_SINGLE_LINE) * ps.font_pt
+        remove_pt   = min(headroom_pt, need_pt)
+        remove_frac = remove_pt / headroom_pt if headroom_pt > 0 else 0.0
+        remove_u    = max(1, int(ps.line_headroom * remove_frac))
+        new_l       = max(floor_v, cur_l - remove_u)
+        actual_rem  = ((cur_l - new_l) / WORD_SINGLE_LINE) * ps.font_pt
+
+        if actual_rem <= 0:
+            continue
+
+        _write_spacing(ps.p_elem, ps.before_tw, ps.after_tw,
+                       line_val=new_l, floor_val=floor_v)
+        log.append(Action(sec.index, ps.idx, ps.text,
+                           "3_line_compress", "w:line",
+                           float(cur_l), float(new_l), actual_rem))
+        total_removed += actual_rem
+        need_pt        = max(0.0, need_pt - actual_rem)
+        touched       += 1
+
+    remaining = sec.overflow_pt
+    _tlog(3, f"min line compress greedy ({touched} paras touched)",
+          total_removed, remaining)
+    return remaining
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TIER R: RESIDUAL DRAIN  (≤2pt remaining)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def residual_drain(sec: Section, log: List[Action]) -> None:
+    max_iters = int(sec.overflow_pt * TWIPS_PER_PT) + 10
+    for _ in range(max_iters):
+        if sec.overflow_pt <= sec.resolved_pt:
+            break
+        states  = sorted(sec.live_states(), key=lambda s: s.para_spacing_pt, reverse=True)
+        changed = False
+        for ps in states:
+            if ps.after_tw > 0:
+                _write_spacing(ps.p_elem, ps.before_tw, ps.after_tw - 1)
+                log.append(Action(sec.index, ps.idx, ps.text,
+                                   "R_residual", "after",
+                                   ps.after_tw / TWIPS_PER_PT,
+                                   (ps.after_tw - 1) / TWIPS_PER_PT,
+                                   1.0 / TWIPS_PER_PT))
+                changed = True
+                break
+            elif ps.before_tw > 0:
+                _write_spacing(ps.p_elem, ps.before_tw - 1, ps.after_tw)
+                log.append(Action(sec.index, ps.idx, ps.text,
+                                   "R_residual", "before",
+                                   ps.before_tw / TWIPS_PER_PT,
+                                   (ps.before_tw - 1) / TWIPS_PER_PT,
+                                   1.0 / TWIPS_PER_PT))
+                changed = True
+                break
+        if not changed:
+            break
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TIER 4: PHYSICAL OVERFLOW SCALE  (last resort)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def tier4_physical_overflow(sec: Section, log: List[Action]) -> float:
+    need_pt = sec.overflow_pt
+    if need_pt <= sec.resolved_pt:
+        return 0.0
+    eff_h  = sec.effective_pdf_h
+    avail  = sec.available_pt
+    if eff_h <= 0:
+        return need_pt
+    scale  = min(1.0, avail / eff_h)
+    if scale >= 1.0:
+        return need_pt
+
+    print(f"    Tier 4 (physical scale ×{scale:.4f}) — tiers 1–3 insufficient")
+    total_removed = 0.0
+    for ps in sec.live_states():
+        new_b  = max(0, int(ps.before_tw * scale))
+        new_a  = max(0, int(ps.after_tw  * scale))
+        cur_l  = ps.effective_line
+        new_l  = max(ps.floor_line, int(cur_l * scale))
+        sp_rem = (ps.before_tw + ps.after_tw - new_b - new_a) / TWIPS_PER_PT
+        ln_rem = ((cur_l - new_l) / WORD_SINGLE_LINE) * ps.font_pt
+        _write_spacing(ps.p_elem, new_b, new_a, line_val=new_l, floor_val=ps.floor_line)
+        for fname, ov, nv, rpt in [
+            ("before", ps.before_tw/TWIPS_PER_PT, new_b/TWIPS_PER_PT, (ps.before_tw-new_b)/TWIPS_PER_PT),
+            ("after",  ps.after_tw/TWIPS_PER_PT,  new_a/TWIPS_PER_PT, (ps.after_tw-new_a)/TWIPS_PER_PT),
+            ("w:line", float(cur_l), float(new_l), ln_rem),
+        ]:
+            if abs(ov - nv) > 0.001:
+                log.append(Action(sec.index, ps.idx, ps.text,
+                                   "4_physical_scale", fname, ov, nv, rpt))
+        total_removed += sp_rem + ln_rem
+    remaining = max(0.0, need_pt - total_removed)
+    _tlog(4, f"physical scale ×{scale:.4f}", total_removed, remaining)
+    return remaining
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TIER 5: REDISTRIBUTE SLACK
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def tier5_redistribute_slack(sec: Section, pre_snap: Dict[int, ParaSnapshot],
+                              log: List[Action]) -> None:
+    if not pre_snap or not sec.params:
+        return
+    current_h = sec.current_content_height_pt()
+    slack_pt  = sec.available_pt - current_h
+    if slack_pt <= 0:
+        return
+    effective_safety = sec.params.expand_safety_pt * sec.params.safety_scale_factor
+    if slack_pt <= effective_safety:
+        return
+
+    budget_pt        = slack_pt - effective_safety
+    remaining_budget = budget_pt
+    print(f"    Tier 5 (restore slack): slack={slack_pt:.2f}pt  "
+          f"safety={effective_safety:.2f}pt  budget={budget_pt:.2f}pt")
+
+    # Phase A: restore paragraph spacing
+    phase_a               = 0.0
+    sp_candidates         = []
+    total_sp_deficit_pt   = 0.0
+    for ps in sec.live_states():
+        snap = pre_snap.get(ps.idx)
+        if snap is None:
+            continue
+        d_tw = (snap.before_tw - ps.before_tw) + (snap.after_tw - ps.after_tw)
+        if d_tw > 0:
+            dp = d_tw / TWIPS_PER_PT
+            sp_candidates.append((ps, snap,
+                                   snap.before_tw - ps.before_tw,
+                                   snap.after_tw  - ps.after_tw, dp))
+            total_sp_deficit_pt += dp
+
+    if total_sp_deficit_pt > 0 and remaining_budget > 0:
+        frac = min(1.0, remaining_budget / total_sp_deficit_pt)
+        for ps, snap, b_def, a_def, dp in sp_candidates:
+            if remaining_budget <= 0:
+                break
+            pl = _read_para(ps.p_elem, ps.idx, ps.in_table, sec.params)
+            new_b = min(snap.before_tw, pl.before_tw + int(b_def * frac))
+            new_a = min(snap.after_tw,  pl.after_tw  + int(a_def * frac))
+            rpt   = ((new_b - pl.before_tw) + (new_a - pl.after_tw)) / TWIPS_PER_PT
+            if rpt <= 0:
+                continue
+            _write_spacing(pl.p_elem, new_b, new_a,
+                           line_val=pl.line_val if pl.has_explicit_line else None)
+            for fname, old_tw, nw in [("before", pl.before_tw, new_b),
+                                       ("after",  pl.after_tw,  new_a)]:
+                if old_tw != nw:
+                    log.append(Action(sec.index, pl.idx, pl.text,
+                                       "5_restore_spacing", fname,
+                                       old_tw / TWIPS_PER_PT, nw / TWIPS_PER_PT,
+                                       -(nw - old_tw) / TWIPS_PER_PT))
+            remaining_budget -= rpt
+            phase_a          += rpt
+
+    # Phase B: restore line spacing
+    phase_b             = 0.0
+    total_ln_deficit_pt = 0.0
+    ln_candidates       = []
+    for ps in sec.live_states():
+        snap   = pre_snap.get(ps.idx)
+        if snap is None:
+            continue
+        snap_l = snap.line_val if snap.line_val > 0 else WORD_SINGLE_LINE
+        if ps.effective_line < snap_l:
+            du  = snap_l - ps.effective_line
+            dp  = (du / WORD_SINGLE_LINE) * ps.font_pt
+            ln_candidates.append((ps, snap_l, du, dp))
+            total_ln_deficit_pt += dp
+
+    if total_ln_deficit_pt > 0 and remaining_budget > effective_safety:
+        frac = min(1.0, remaining_budget / total_ln_deficit_pt)
+        for ps, snap_l, du, dp in ln_candidates:
+            if remaining_budget <= 0:
+                break
+            pl  = _read_para(ps.p_elem, ps.idx, ps.in_table, sec.params)
+            ru  = max(0, int(du * frac))
+            if ru == 0:
+                continue
+            new_l = min(snap_l, pl.effective_line + ru)
+            rpt   = ((new_l - pl.effective_line) / WORD_SINGLE_LINE) * pl.font_pt
+            if rpt <= 0:
+                continue
+            _write_spacing(pl.p_elem, pl.before_tw, pl.after_tw,
+                           line_val=new_l, floor_val=pl.floor_line)
+            log.append(Action(sec.index, pl.idx, pl.text,
+                               "5_restore_line", "w:line",
+                               float(pl.effective_line), float(new_l), -rpt))
+            remaining_budget -= rpt
+            phase_b          += rpt
+
+    total_r = phase_a + phase_b
+    if total_r > 0:
+        print(f"    Tier 5 restored: +{total_r:.2f}pt  "
+              f"safety retained: {remaining_budget:.2f}pt")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PER-PAGE COMPRESS ORCHESTRATOR
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compress_page(sec: Section, log: List[Action], doc: Document,
+                  page_object=None) -> None:
+    """
+    Orchestrate all compression tiers for a single overflowing page.
+
+    FIX 1: page_object must still be a live pdfplumber Page (caller holds
+    the session open).  This function no longer opens pdfplumber itself.
+    """
+    if not sec.is_overflow:
+        return
+
+    # FIX 3: params derived AFTER geo is assigned (done in parse_sections)
+    sec.params = _derive_page_params(sec.geo, sec, page_object)
+    overflow   = sec.overflow_pt
+
+    t1 = sec.tier1_capacity_pt()
+    t2 = sec.tier2_capacity_pt()
+    t3 = sec.tier3_capacity_pt()
+    buf_str = f"×{sec.geo.buffer:.4f}" if sec.geo else "N/A"
+
+    print(f"\n  ── Page {sec.index}  "
+          f"overflow={overflow:.3f}pt  avail={sec.available_pt:.2f}pt  "
+          f"eff_h={sec.effective_pdf_h:.2f}pt  buf={buf_str}")
+    print(f"     Capacity  T1(para_sp)={t1:.2f}pt  "
+          f"T2(above_single)={t2:.2f}pt  T3(to_floor)={t3:.2f}pt  "
+          f"total={t1+t2+t3:.2f}pt")
+    print(f"     Floor ratio: {sec.params.floor_ratio:.4f}")
+
+    if t1 + t2 + t3 < overflow:
+        print(f"     ⚠ Max compressible ({t1+t2+t3:.2f}pt) < overflow ({overflow:.2f}pt)"
+              f" → tier 4 will be needed")
+
+    pre_snap = sec.snapshot_all()
+
+    materialize_line_spacing(sec, log, doc)
+
+    if sec.is_overflow:
+        tier1_drain_para_spacing(sec, log)
+
+    if sec.is_overflow:
+        tier2_compress_above_single(sec, log)
+
+    if sec.is_overflow:
+        tier3_minimum_line_compression(sec, log)
+
+    if 0 < sec.overflow_pt <= 2.0:
+        residual_drain(sec, log)
+
+    if sec.is_overflow:
+        tier4_physical_overflow(sec, log)
+
+    if not sec.is_overflow:
+        print(f"     ✓ RESOLVED  (remaining: {sec.overflow_pt:.4f}pt)")
+        tier5_redistribute_slack(sec, pre_snap, log)
+    else:
+        print(f"     ✗ STILL OVER by {sec.overflow_pt:.3f}pt — "
+              f"content is physically too large for page")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN ORCHESTRATOR  — FIX 1 & FIX 4
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def fix_overflow(
+    temp_docx:   str,
+    geos:        List[PageGeometry],
+    output_docx: str,
+    pdf_lines:   Dict[int, List[PdfLine]],
+    pdf_path:    str,            # FIX 4: pass PDF path explicitly
+) -> None:
+    _hdr("STEP 3: INLINE FIX + PAGE-LEVEL OVERFLOW CORRECTION  (v15-fixed)")
+
+    doc      = Document(temp_docx)
+    sections = parse_sections(doc, geos)
+
+    print(f"\n  PDF pages     : {len(geos)}")
+    print(f"  DOCX sections : {len(sections)}")
+
+    _save_diag(sections, geos)
+    _print_section_table(sections, "INITIAL STATE")
+
+    log: List[Action] = []
+
+    # Step A: Fix inline line-level overflow
+    inline_fixed = fix_inline_line_overflow(sections, pdf_lines, log)
+    if inline_fixed > 0:
+        _print_section_table(sections, "AFTER INLINE FIX")
+
+    # Step B: Per-page overflow compression
+    overflow_secs = [s for s in sections if s.is_overflow]
+    ok_secs       = [s for s in sections if not s.is_overflow]
+
+    if overflow_secs:
+        print(f"\n  Overflowing pages    : {[s.index for s in overflow_secs]}")
+        print(f"  OK pages (untouched) : {[s.index for s in ok_secs]}")
+
+        # FIX 1: open ONE pdfplumber session and keep it alive for the
+        # entire compression pass so page objects remain valid.
+        try:
+            with pdfplumber.open(pdf_path) as pdf_handle:
+                page_objects: Dict[int, object] = {
+                    idx: pg for idx, pg in enumerate(pdf_handle.pages, 1)
+                }
+                for sec in overflow_secs:
+                    compress_page(sec, log, doc, page_objects.get(sec.index))
+        except Exception as exc:
+            print(f"  [warn] pdfplumber session failed ({exc}); "
+                  f"retrying without page objects (floor = typographic default)")
+            for sec in overflow_secs:
+                compress_page(sec, log, doc, page_object=None)
+
+        _print_section_table(sections, "FINAL STATE")
+        still = [s for s in sections if s.is_overflow]
+        if still:
+            print(f"\n  ⚠ Still overflowing: {[s.index for s in still]}")
+        else:
+            print(f"\n  ✓ All overflow resolved.")
+    else:
+        print("\n  No page overflow detected after inline fix.")
+
+    print(f"\n  ✓ Inline lines fixed : {inline_fixed}")
+
+    _save_log(log, sections)
+    doc.save(output_docx)
+    _cleanup(temp_docx)
+    print(f"\n  Output → {output_docx}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DISPLAY & LOGGING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _hdr(title: str) -> None:
+    print(f"\n{'═'*72}\n  {title}\n{'═'*72}")
+
+
+def _tlog(tier, name, removed, residual):
+    print(f"    Tier {tier} ({name:<50s}) "
+          f"removed={removed:.3f}pt  remaining={residual:.3f}pt")
+
+
+def _print_section_table(sections: List[Section], title: str) -> None:
+    print(f"\n  {title}")
+    print(f"  {'Pg':>3}  {'EffH':>8}  {'Avail':>8}  {'Over':>8}  "
+          f"{'T1':>6}  {'T2':>6}  {'T3':>6}  Status")
+    print("  " + "─" * 74)
+    for sec in sections:
+        ov  = sec.overflow_pt
+        t1  = sec.tier1_capacity_pt()
+        t2  = sec.tier2_capacity_pt()
+        t3  = sec.tier3_capacity_pt()
+        st  = f"OVER +{ov:.2f}pt" if ov > MIN_OVERFLOW_TRIGGER_PT else "OK"
+        print(f"  {sec.index:>3}  {sec.effective_pdf_h:>8.2f}  "
+              f"{sec.available_pt:>8.2f}  {ov:>8.3f}  "
+              f"{t1:>6.2f}  {t2:>6.2f}  {t3:>6.2f}  {st}")
+
+
+def _save_diag(sections, geos):
+    geo_map = {g.page_num: g for g in geos}
+    out = []
+    for sec in sections:
+        pg = geo_map.get(sec.index)
+        out.append({
+            "section":       sec.index,
+            "docx_geometry": {
+                "page_h_pt":    round(sec.page_h_pt,    2),
+                "available_pt": round(sec.available_pt,  2),
+                "col_width_pt": round(sec.available_width_pt(), 2),
+            },
+            "pdf_geometry":  pg.to_dict() if pg else {},
+            "overflow_pt":   round(sec.overflow_pt, 3),
+            "is_overflow":   sec.is_overflow,
+            "paragraphs":    [s.to_dict() for s in sec.live_states()],
+        })
+    with open(DIAG_JSON, "w", encoding="utf-8") as f:
+        json.dump({"tool": "pdf_to_docx_v15_fixed",
+                   "sections": out}, f, indent=2, ensure_ascii=False)
+    print(f"\n  Diagnostic → {DIAG_JSON}")
+
+
+def _save_log(log: List[Action], sections: List[Section]) -> None:
+    by_sec: Dict[int, List[Action]] = {}
+    for a in log:
+        by_sec.setdefault(a.section, []).append(a)
+    sec_map = {s.index: s for s in sections}
+    out = []
+    for idx in sorted(by_sec):
+        acts = by_sec[idx]
+        sec  = sec_map.get(idx)
+        out.append({
+            "section":           idx,
+            "available_pt":      round(sec.available_pt, 2) if sec else None,
+            "final_overflow_pt": round(sec.overflow_pt,  3) if sec else None,
+            "net_delta_pt":      round(sum(a.delta_pt for a in acts), 3),
+            "action_count":      len(acts),
+            "by_tier":           {
+                t: round(sum(a.delta_pt for a in acts if a.tier == t), 3)
+                for t in sorted({a.tier for a in acts})
+            },
+            "actions": [a.to_dict() for a in acts],
+        })
+    data = {"tool": "pdf_to_docx_v15_fixed",
+            "total_actions": len(log),
+            "sections_touched": len(out),
+            "sections": out}
+    with open(LOG_JSON, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    print(f"  Log → {LOG_JSON}")
+
+
+def _cleanup(path: str) -> None:
+    if os.path.exists(path):
+        os.remove(path)
+        print(f"  Removed temp: {path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN  — FIX 4: corrected argument wiring
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    _hdr("PDF → DOCX  |  Priority-Based Overflow Compression  v15-fixed")
+    print(f"""
+  PDF    : {PDF_PATH}
+  Output : {OUTPUT_DOCX}
+
+  FIXES IN THIS VERSION
+  ─────────────────────────────────────────────────────────────────────
+  FIX 1  pdfplumber session kept alive during compression (page objects
+         no longer go stale)
+
+  FIX 2  available_pt = page_h - max(docx_margin, pdf_margin) on each
+         side; guaranteed positive with a 5% fallback
+
+  FIX 3  geo assigned to sections before params are derived
+
+  FIX 4  fix_overflow wired correctly (pdf_path passed explicitly;
+         pdf_footers argument removed since footer code is commented out)
+
+  FIX 5  overflow only triggered when > {MIN_OVERFLOW_TRIGGER_PT}pt (suppresses FP noise)
+
+  FIX 6  section reconciler splits content on page-break markers when
+         pdf2docx produces fewer sections than PDF pages
+""")
+
+    if not os.path.exists(PDF_PATH):
+        print(f"  ERROR: PDF not found: {PDF_PATH}")
+        sys.exit(1)
+
+    try:
+        geos      = extract_pdf_layout(PDF_PATH)
+        pdf_lines = extract_pdf_lines_per_page(PDF_PATH)
+
+        input("\n  Press ENTER to convert PDF → DOCX ...")
+        convert_pdf_to_docx(PDF_PATH, TEMP_DOCX)
+
+        input("\n  Press ENTER to run fixes ...")
+        fix_overflow(TEMP_DOCX, geos, OUTPUT_DOCX, pdf_lines, PDF_PATH)
+
+        _hdr("DONE")
+        print(f"  {DIAG_JSON}  — geometry + overflow diagnostics")
+        print(f"  {LOG_JSON}   — all compression actions by tier")
+        print(f"  {OUTPUT_DOCX} — verify in Word:")
+        print(f"    • Page count = {len(geos)} (should match PDF)")
+        print(f"    • Text should remain within each page without merging\n")
+
+    except Exception as exc:
+        import traceback
+        print(f"\n  ERROR  {type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
